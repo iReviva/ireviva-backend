@@ -5,9 +5,120 @@ import fetch from "node-fetch";
 const app = express();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
-// Anti-doublon simple en mémoire
 const processedEvents = new Set();
 
+function splitName(fullName = "") {
+  const parts = fullName.trim().split(" ");
+  return {
+    first_name: parts[0] || "",
+    last_name: parts.slice(1).join(" ") || "",
+  };
+}
+
+function buildAddress(customerDetails) {
+  const name = splitName(customerDetails?.name || "");
+  const address = customerDetails?.address || {};
+
+  return {
+    first_name: name.first_name,
+    last_name: name.last_name,
+    address1: address.line1 || "",
+    address2: address.line2 || "",
+    city: address.city || "",
+    province: address.state || "",
+    country: address.country || "",
+    zip: address.postal_code || "",
+    phone: customerDetails?.phone || "",
+  };
+}
+
+// ✅ Backend OK
+app.get("/", (req, res) => {
+  res.send("Backend iReviva OK ✅");
+});
+
+// ✅ OAuth Shopify - installation app
+app.get("/auth", (req, res) => {
+  const shop = process.env.SHOPIFY_STORE;
+
+  const installUrl =
+    `https://${shop}/admin/oauth/authorize` +
+    `?client_id=${process.env.SHOPIFY_CLIENT_ID}` +
+    `&scope=read_orders,write_orders` +
+    `&redirect_uri=${process.env.REDIRECT_URI}`;
+
+  console.log("👉 URL INSTALL:", installUrl);
+  res.redirect(installUrl);
+});
+
+// ✅ OAuth Shopify - récupération token
+app.get("/callback", async (req, res) => {
+  const { code } = req.query;
+
+  try {
+    const response = await fetch(
+      `https://${process.env.SHOPIFY_STORE}/admin/oauth/access_token`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          client_id: process.env.SHOPIFY_CLIENT_ID,
+          client_secret: process.env.SHOPIFY_CLIENT_SECRET,
+          code,
+        }),
+      }
+    );
+
+    const data = await response.json();
+
+    console.log("🔥 SHOPIFY ACCESS TOKEN:", data.access_token);
+
+    res.send("App installée ✅ Regarde les logs Render");
+  } catch (err) {
+    console.error("❌ OAuth error:", err.message);
+    res.status(500).send("Erreur OAuth");
+  }
+});
+
+// ✅ Option backend checkout propre
+app.post("/create-checkout-session", express.json(), async (req, res) => {
+  try {
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      customer_creation: "always",
+      billing_address_collection: "required",
+      phone_number_collection: {
+        enabled: true,
+      },
+      shipping_address_collection: {
+        allowed_countries: ["US", "CA", "GB", "FR", "DE", "IT", "ES", "SA", "AE"],
+      },
+      line_items: [
+        {
+          price_data: {
+            currency: "usd",
+            product_data: {
+              name: "iReviva™ Face & Neck LED Mask",
+            },
+            unit_amount: 29900,
+          },
+          quantity: 1,
+        },
+      ],
+      success_url: "https://ireviva.com/success",
+      cancel_url: "https://ireviva.com/cancel",
+    });
+
+    res.json({ url: session.url });
+  } catch (err) {
+    console.error("❌ Stripe checkout error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ✅ Stripe Webhook → Shopify Order
 app.post("/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   let event;
 
@@ -32,47 +143,42 @@ app.post("/webhook", express.raw({ type: "application/json" }), async (req, res)
   if (event.type === "checkout.session.completed") {
     const session = event.data.object;
 
-    const email = session.customer_details?.email || "no-email";
-    const name = session.customer_details?.name || "Customer";
+    const customerDetails = session.customer_details || {};
+    const email = customerDetails.email || "no-email";
+    const fullName = customerDetails.name || "";
+    const phone = customerDetails.phone || "";
     const amount = ((session.amount_total || 0) / 100).toFixed(2);
 
-    const address = session.customer_details?.address;
+    const name = splitName(fullName);
+    const address = buildAddress(customerDetails);
 
     const orderPayload = {
       order: {
         email,
         financial_status: "paid",
-        note: `Stripe Checkout Session: ${session.id}`,
+        currency: "USD",
         tags: "Stripe, iReviva, Auto Order",
+        note: `Stripe Checkout Session: ${session.id}`,
+
         customer: {
-          first_name: name.split(" ")[0] || name,
-          last_name: name.split(" ").slice(1).join(" ") || "",
-          email
+          first_name: name.first_name,
+          last_name: name.last_name,
+          email,
+          phone,
         },
+
+        shipping_address: address,
+        billing_address: address,
+
         line_items: [
           {
-            title: "iReviva™ Pro 234 LED Mask",
+            title: "iReviva™ Face & Neck LED Mask",
             price: amount,
-            quantity: 1
-          }
-        ]
-      }
+            quantity: 1,
+          },
+        ],
+      },
     };
-
-    if (address) {
-      orderPayload.order.shipping_address = {
-        first_name: name.split(" ")[0] || name,
-        last_name: name.split(" ").slice(1).join(" ") || "",
-        address1: address.line1 || "",
-        address2: address.line2 || "",
-        city: address.city || "",
-        province: address.state || "",
-        country: address.country || "",
-        zip: address.postal_code || ""
-      };
-
-      orderPayload.order.billing_address = orderPayload.order.shipping_address;
-    }
 
     try {
       const response = await fetch(
@@ -81,9 +187,9 @@ app.post("/webhook", express.raw({ type: "application/json" }), async (req, res)
           method: "POST",
           headers: {
             "X-Shopify-Access-Token": process.env.SHOPIFY_ACCESS_TOKEN,
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
           },
-          body: JSON.stringify(orderPayload)
+          body: JSON.stringify(orderPayload),
         }
       );
 
@@ -100,50 +206,6 @@ app.post("/webhook", express.raw({ type: "application/json" }), async (req, res)
   }
 
   res.status(200).json({ received: true });
-});
-
-app.get("/auth", (req, res) => {
-  const shop = process.env.SHOPIFY_STORE;
-
-  const installUrl =
-    `https://${shop}/admin/oauth/authorize` +
-    `?client_id=${process.env.SHOPIFY_CLIENT_ID}` +
-    `&scope=read_orders,write_orders` +
-    `&redirect_uri=${process.env.REDIRECT_URI}`;
-
-  console.log("👉 URL INSTALL:", installUrl);
-  res.redirect(installUrl);
-});
-
-app.get("/callback", async (req, res) => {
-  const { code } = req.query;
-
-  try {
-    const response = await fetch(
-      `https://${process.env.SHOPIFY_STORE}/admin/oauth/access_token`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          client_id: process.env.SHOPIFY_CLIENT_ID,
-          client_secret: process.env.SHOPIFY_CLIENT_SECRET,
-          code
-        })
-      }
-    );
-
-    const data = await response.json();
-
-    console.log("🔥 SHOPIFY ACCESS TOKEN:", data.access_token);
-    res.send("App installée ✅ Regarde les logs Render");
-  } catch (err) {
-    console.error("❌ OAuth error:", err.message);
-    res.status(500).send("Erreur OAuth");
-  }
-});
-
-app.get("/", (req, res) => {
-  res.send("Backend iReviva OK ✅");
 });
 
 const PORT = process.env.PORT || 3000;
