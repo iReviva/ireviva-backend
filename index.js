@@ -3,88 +3,104 @@ import Stripe from "stripe";
 import fetch from "node-fetch";
 
 const app = express();
-
-// =====================
-// CONFIG
-// =====================
-
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
-// ⚠️ IMPORTANT pour Stripe webhook
-app.post(
-  "/webhook",
-  express.raw({ type: "application/json" }),
-  async (req, res) => {
-    const sig = req.headers["stripe-signature"];
+// Anti-doublon simple en mémoire
+const processedEvents = new Set();
 
-    let event;
+app.post("/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      req.headers["stripe-signature"],
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    console.error("❌ Stripe signature error:", err.message);
+    return res.status(400).send("Webhook signature error");
+  }
+
+  if (processedEvents.has(event.id)) {
+    console.log("⚠️ Event déjà traité:", event.id);
+    return res.status(200).json({ duplicate: true });
+  }
+
+  processedEvents.add(event.id);
+
+  if (event.type === "checkout.session.completed") {
+    const session = event.data.object;
+
+    const email = session.customer_details?.email || "no-email";
+    const name = session.customer_details?.name || "Customer";
+    const amount = ((session.amount_total || 0) / 100).toFixed(2);
+
+    const address = session.customer_details?.address;
+
+    const orderPayload = {
+      order: {
+        email,
+        financial_status: "paid",
+        note: `Stripe Checkout Session: ${session.id}`,
+        tags: "Stripe, iReviva, Auto Order",
+        customer: {
+          first_name: name.split(" ")[0] || name,
+          last_name: name.split(" ").slice(1).join(" ") || "",
+          email
+        },
+        line_items: [
+          {
+            title: "iReviva™ Pro 234 LED Mask",
+            price: amount,
+            quantity: 1
+          }
+        ]
+      }
+    };
+
+    if (address) {
+      orderPayload.order.shipping_address = {
+        first_name: name.split(" ")[0] || name,
+        last_name: name.split(" ").slice(1).join(" ") || "",
+        address1: address.line1 || "",
+        address2: address.line2 || "",
+        city: address.city || "",
+        province: address.state || "",
+        country: address.country || "",
+        zip: address.postal_code || ""
+      };
+
+      orderPayload.order.billing_address = orderPayload.order.shipping_address;
+    }
 
     try {
-      event = stripe.webhooks.constructEvent(
-        req.body,
-        sig,
-        process.env.STRIPE_WEBHOOK_SECRET
+      const response = await fetch(
+        `https://${process.env.SHOPIFY_STORE}/admin/api/2024-01/orders.json`,
+        {
+          method: "POST",
+          headers: {
+            "X-Shopify-Access-Token": process.env.SHOPIFY_ACCESS_TOKEN,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(orderPayload)
+        }
       );
-    } catch (err) {
-      console.error("❌ Stripe signature error:", err.message);
-      return res.status(400).send();
-    }
 
-    console.log("✅ Stripe event reçu:", event.type);
+      const data = await response.json();
 
-    // =====================
-    // CHECKOUT COMPLETED
-    // =====================
-
-    if (event.type === "checkout.session.completed") {
-      const session = event.data.object;
-
-      const email = session.customer_details?.email || "no-email";
-      const amount = (session.amount_total || 0) / 100;
-
-      console.log("💰 Paiement reçu:", email, amount);
-
-      try {
-        const response = await fetch(
-          `https://${process.env.SHOPIFY_STORE}/admin/api/2024-01/orders.json`,
-          {
-            method: "POST",
-            headers: {
-              "X-Shopify-Access-Token":
-                process.env.SHOPIFY_ACCESS_TOKEN,
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              order: {
-                email: email,
-                financial_status: "paid",
-                line_items: [
-                  {
-                    title: "iReviva™ Pro 234 LED Mask",
-                    price: amount.toString(),
-                    quantity: 1,
-                  },
-                ],
-              },
-            }),
-          }
-        );
-
-        const data = await response.json();
-
-        console.log("🛒 Shopify réponse:", data);
-      } catch (err) {
-        console.error("❌ Shopify error:", err.message);
+      if (!response.ok) {
+        console.error("❌ Shopify API error:", response.status, data);
+      } else {
+        console.log("✅ Shopify order created:", data.order?.name || data.order?.id);
       }
+    } catch (err) {
+      console.error("❌ Shopify fetch error:", err.message);
     }
-
-    res.json({ received: true });
   }
-);
 
-// =====================
-// 🔐 OAUTH SHOPIFY (INSTALL)
-// =====================
+  res.status(200).json({ received: true });
+});
 
 app.get("/auth", (req, res) => {
   const shop = process.env.SHOPIFY_STORE;
@@ -96,13 +112,8 @@ app.get("/auth", (req, res) => {
     `&redirect_uri=${process.env.REDIRECT_URI}`;
 
   console.log("👉 URL INSTALL:", installUrl);
-
   res.redirect(installUrl);
 });
-
-// =====================
-// 🔐 CALLBACK (RÉCUPÈRE TOKEN)
-// =====================
 
 app.get("/callback", async (req, res) => {
   const { code } = req.query;
@@ -112,40 +123,31 @@ app.get("/callback", async (req, res) => {
       `https://${process.env.SHOPIFY_STORE}/admin/oauth/access_token`,
       {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           client_id: process.env.SHOPIFY_CLIENT_ID,
           client_secret: process.env.SHOPIFY_CLIENT_SECRET,
-          code: code,
-        }),
+          code
+        })
       }
     );
 
     const data = await response.json();
 
     console.log("🔥 SHOPIFY ACCESS TOKEN:", data.access_token);
-
     res.send("App installée ✅ Regarde les logs Render");
   } catch (err) {
     console.error("❌ OAuth error:", err.message);
-    res.send("Erreur OAuth");
+    res.status(500).send("Erreur OAuth");
   }
 });
 
-// =====================
-// DEFAULT ROUTE
-// =====================
-
 app.get("/", (req, res) => {
-  res.send("Backend iReviva OK");
+  res.send("Backend iReviva OK ✅");
 });
 
-// =====================
-// START SERVER
-// =====================
+const PORT = process.env.PORT || 3000;
 
-app.listen(3000, () => {
-  console.log("🚀 Server running on port 3000");
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
 });
