@@ -4,12 +4,50 @@ import fetch from "node-fetch";
 
 const app = express();
 
-// ⚠️ IMPORTANT : RAW body pour Stripe (AVANT tout)
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
+// =====================
+// 🔐 OAUTH SHOPIFY
+// =====================
+
+app.get("/auth", (req, res) => {
+  const shop = process.env.SHOPIFY_STORE;
+
+  const installUrl = `https://${shop}/admin/oauth/authorize?client_id=${process.env.SHOPIFY_CLIENT_ID}&scope=write_orders&redirect_uri=${process.env.REDIRECT_URI}`;
+
+  res.redirect(installUrl);
+});
+
+app.get("/callback", async (req, res) => {
+  const { shop, code } = req.query;
+
+  const response = await fetch(`https://${shop}/admin/oauth/access_token`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      client_id: process.env.SHOPIFY_CLIENT_ID,
+      client_secret: process.env.SHOPIFY_CLIENT_SECRET,
+      code,
+    }),
+  });
+
+  const data = await response.json();
+
+  console.log("🔥 SHOPIFY ACCESS TOKEN:", data.access_token);
+
+  res.send("App installed. Check Render logs.");
+});
+
+// =====================
+// 🔥 WEBHOOK STRIPE
+// =====================
+
 app.post(
   "/webhook",
   express.raw({ type: "application/json" }),
   async (req, res) => {
-    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
     const sig = req.headers["stripe-signature"];
 
     let event;
@@ -20,24 +58,15 @@ app.post(
         sig,
         process.env.STRIPE_WEBHOOK_SECRET
       );
-
-      console.log("🔥 EVENT:", event.type);
-
     } catch (err) {
-      console.error("❌ SIGNATURE ERROR:", err.message);
-      return res.status(400).send(`Webhook Error: ${err.message}`);
+      console.error("❌ Stripe error:", err.message);
+      return res.status(400).send();
     }
 
-    // ============================
-    // ✅ CHECKOUT SUCCESS
-    // ============================
     if (event.type === "checkout.session.completed") {
       const session = event.data.object;
 
       const email = session.customer_details?.email;
-      const amount = session.amount_total / 100;
-
-      console.log("✅ CHECKOUT OK:", email, amount);
 
       try {
         const response = await fetch(
@@ -50,12 +79,12 @@ app.post(
             },
             body: JSON.stringify({
               order: {
-                email: email,
+                email,
                 financial_status: "paid",
                 line_items: [
                   {
-                    title: "iReviva™ Pro 234 LED Mask",
-                    price: amount,
+                    title: "iReviva™ Mask",
+                    price: "199.00",
                     quantity: 1,
                   },
                 ],
@@ -72,19 +101,10 @@ app.post(
       }
     }
 
-    res.status(200).json({ received: true });
+    res.json({ received: true });
   }
 );
 
-// ⚠️ JSON parser APRÈS webhook
 app.use(express.json());
 
-app.get("/", (req, res) => {
-  res.send("iReviva backend running ✅");
-});
-
-const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
+app.listen(3000, () => console.log("Server running"));
