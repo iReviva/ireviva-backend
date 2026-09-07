@@ -70,7 +70,9 @@ async function sendOpenAIOrderCreated(session, eventCreatedSeconds) {
     },
   };
 
-  const oppref = session.metadata?.openai_oppref;
+  const oppref =
+    session.client_reference_id || session.metadata?.openai_oppref;
+
   if (oppref) {
     conversionEvent.oppref = oppref;
   }
