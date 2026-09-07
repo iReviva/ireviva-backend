@@ -33,6 +33,78 @@ function buildAddress(details = {}) {
   };
 }
 
+async function sendOpenAIOrderCreated(session, eventCreatedSeconds) {
+  const pixelId = process.env.OPENAI_ADS_PIXEL_ID;
+  const apiKey = process.env.OPENAI_ADS_CONVERSIONS_API_KEY;
+
+  if (!pixelId || !apiKey) {
+    console.log("ℹ️ OpenAI Ads CAPI not configured; skipping conversion event");
+    return;
+  }
+
+  // Never send Stripe test-mode purchases into the live Ads measurement source.
+  if (session.livemode === false) {
+    console.log("🧪 OpenAI Ads CAPI skipped for Stripe test payment");
+    return;
+  }
+
+  const conversionEvent = {
+    id: session.id,
+    type: "order_created",
+    timestamp_ms:
+      Number(eventCreatedSeconds || session.created || Math.floor(Date.now() / 1000)) * 1000,
+    source_url: "https://ireviva.com/success",
+    action_source: "web",
+    data: {
+      type: "contents",
+      amount: Number(session.amount_total || 0),
+      currency: String(session.currency || "usd").toUpperCase(),
+      contents: [
+        {
+          id: "ireviva-stripe-checkout",
+          name: "iReviva™ Face & Neck LED Mask",
+          content_type: "product",
+          quantity: 1,
+        },
+      ],
+    },
+  };
+
+  const oppref = session.metadata?.openai_oppref;
+  if (oppref) {
+    conversionEvent.oppref = oppref;
+  }
+
+  const response = await fetch(
+    `https://bzr.openai.com/v1/events?pid=${encodeURIComponent(pixelId)}`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        validate_only: false,
+        integration_source: "ireviva_stripe_checkout",
+        events: [conversionEvent],
+      }),
+    }
+  );
+
+  const responseText = await response.text();
+
+  if (!response.ok) {
+    throw new Error(
+      `OpenAI Ads CAPI ${response.status}: ${responseText || "request failed"}`
+    );
+  }
+
+  console.log(
+    `✅ OpenAI order_created sent: ${session.id}`,
+    responseText || "accepted"
+  );
+}
+
 // ===== Health check =====
 app.get("/", (req, res) => {
   res.send("Backend iReviva OK ✅");
@@ -41,6 +113,17 @@ app.get("/", (req, res) => {
 // ===== Checkout session =====
 app.post("/create-checkout-session", express.json(), async (req, res) => {
   try {
+    const rawOppref = req.body?.oppref;
+    const oppref =
+      typeof rawOppref === "string" && rawOppref.trim()
+        ? rawOppref.trim().slice(0, 500)
+        : null;
+
+    const metadata = {};
+    if (oppref) {
+      metadata.openai_oppref = oppref;
+    }
+
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
       customer_creation: "always",
@@ -54,6 +137,8 @@ app.post("/create-checkout-session", express.json(), async (req, res) => {
       phone_number_collection: {
         enabled: true,
       },
+
+      metadata,
 
       line_items: [
         {
@@ -133,6 +218,14 @@ app.post("/webhook", express.raw({ type: "application/json" }), async (req, res)
   const name = splitName(finalDetails.name);
   const address = buildAddress(finalDetails);
   const amount = ((session.amount_total || 0) / 100).toFixed(2);
+
+  // ===== OPENAI ADS CONVERSION =====
+  try {
+    await sendOpenAIOrderCreated(session, event.created);
+  } catch (err) {
+    // Tracking failure must never block order creation or webhook acknowledgement.
+    console.error("❌ OpenAI Ads CAPI error:", err.message);
+  }
 
   // ===== SHOPIFY ORDER =====
   const orderPayload = {
